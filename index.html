@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DataCanvas</title>
+    
+    <meta name="description" content="A web-based data visualization tool to analyze and explore datasets.">
+    <meta name="theme-color" content="#ffffff">
+
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctitle%3EDataCanvas Logo%3C/title%3E%3Crect x='15' y='15' width='30' height='30' rx='5' fill='%2340a9ff'/%3E%3Crect x='55' y='15' width='30' height='30' rx='5' fill='%2369c0ff'/%3E%3Crect x='15' y='55' width='30' height='30' rx='5' fill='%2391d5ff'/%3E%3Crect x='55' y='55' width='30' height='30' rx='5' fill='%23bae7ff'/%3E%3C/svg%3E">
+    
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap" rel="stylesheet">
+    
+    <script>
+      (function() {
+        try {
+          const theme = localStorage.getItem('datacanvas-theme');
+          if (theme === 'dark' || (!theme && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+            document.documentElement.classList.add('dark');
+          }
+        } catch (e) { /* Fails safely */ }
+      })();
+    </script>
+
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<noscript>
+    <div class="noscript-warning">
+        <strong>DataCanvas requires JavaScript to be enabled.</strong>
+    </div>
+</noscript>
+
+<div id="app" class="app-layout" role="application">
+    
+    <div class="spinner-overlay" v-if="uiState.isLoading" aria-busy="true">
+        <div class="spinner" role="status"></div>
+    </div>
+
+    <aside class="data-panel">
+        <header class="panel-header">
+            <div class="header-top-row">
+                <h2>Data Fields</h2>
+                <div class="undo-redo-controls">
+                    <button @click="undo" :disabled="!canUndo" title="Undo">↶</button>
+                    <button @click="redo" :disabled="!canRedo" title="Redo">↷</button>
+                </div>
+            </div>
+            <div class="view-switcher">
+                <button :class="{ active: uiState.viewMode === 'worksheet' }" @click="uiState.viewMode = 'worksheet'">Worksheet</button>
+                <button :class="{ active: uiState.viewMode === 'dashboard' }" @click="uiState.viewMode = 'dashboard'">Dashboard</button>
+            </div>
+            <div class="panel-actions">
+                <label for="file-input" class="file-upload-label">{{ dataState.file ? dataState.file.name : 'Load Data' }}</label>
+                <input type="file" id="file-input" @change="handleFileUpload" accept=".csv,.datacanvas" class="visually-hidden">
+                <button class="action-button" @click="saveWorkspace" v-if="dataState.records.length">Save Workspace</button>
+                <button class="action-button secondary" @click="modals.calculatedField = true" v-if="dataState.records.length">Create Calculated Field</button>
+
+                <div class="url-loader" v-if="!dataState.records.length">
+                    <input type="url" class="url-input" v-model="dataState.dataUrl" placeholder="Or paste URL to raw CSV...">
+                    <button class="action-button" @click="loadDataFromUrl">Load</button>
+                </div>
+            </div>
+        </header>
+        <div class="field-list" v-if="dataState.records.length">
+            <h3>Dimensions</h3>
+            <draggable :list="dataState.dimensions" class="draggable-zone" item-key="name" :group="{ name: 'fields', pull: 'clone', put: false }">
+                <template #item="{element}">
+                    <div class="field-pill dimension" @contextmenu.prevent="showContextMenu(element, $event)">
+                        {{ element.name }}
+                    </div>
+                </template>
+            </draggable>
+            <h3>Measures</h3>
+            <draggable :list="dataState.measures" class="draggable-zone" item-key="name" :group="{ name: 'fields', pull: 'clone', put: false }">
+                <template #item="{element}">
+                    <div class="field-pill measure" @contextmenu.prevent="showContextMenu(element, $event)">
+                        {{ element.name }}
+                    </div>
+                </template>
+            </draggable>
+        </div>
+    </aside>
+
+    <div class="main-container" v-if="dataState.records.length > 0">
+        <main class="main-content" v-if="uiState.viewMode === 'worksheet' && activeWorksheet">
+            
+            <div v-if="!settings.autoUpdateEnabled && uiState.isDirty" class="update-banner">
+                <span>The view has changed.</span>
+                <button class="action-button" @click="applyManualUpdate">Update</button>
+            </div>
+            
+            <div class="shelves-and-filters">
+                <button class="action-button add-to-dash-button" @click="addToDashboard">Add to Dashboard</button>
+                <div class="shelves-panel">
+                    <div class="shelf-group">
+                        <label>Columns (X-Axis)</label>
+                        <draggable v-model="activeShelves.columns" class="shelf" item-key="name" group="fields" @change="handleShelfUpdate">
+                            <template #item="{element}">
+                                <div :class="['field-pill', element.type]">
+                                    <span v-if="element.isDate">
+                                        {{ element.name }} ({{ element.drillLevel }})
+                                        <span class="drill-controls">
+                                            <button @click.stop="drillDate(element, 'up')" :disabled="element.drillLevel === 'year'">-</button>
+                                            <button @click.stop="drillDate(element, 'down')" :disabled="element.drillLevel === 'month'">+</button>
+                                        </span>
+                                    </span>
+                                    <span v-else>{{ element.name }}</span>
+                                    <button class="sort-icon-container" @click.stop="toggleSort(element)" :class="getSortClass(element)">
+                                        <svg class="sort-svg" viewBox="0 0 10 16"><path fill-rule="evenodd" d="M5 11L0 6l1.5-1.5L5 8.25 8.5 4.5 10 6z"></path></svg>
+                                    </button>
+                                    <button @click="removeFromShelf('columns', element)" class="remove-pill">×</button>
+                                </div>
+                            </template>
+                        </draggable>
+                    </div>
+                    <div class="shelf-group">
+                        <label>Rows (Y-Axis)</label>
+                        <draggable v-model="activeShelves.rows" class="shelf" item-key="name" group="fields" @change="handleShelfUpdate">
+                            <template #item="{element}">
+                                <div :class="['field-pill', element.type]">
+                                    <span v-if="element.isDate">
+                                        {{ element.name }} ({{ element.drillLevel }})
+                                        <span class="drill-controls">
+                                            <button @click.stop="drillDate(element, 'up')" :disabled="element.drillLevel === 'year'">-</button>
+                                            <button @click.stop="drillDate(element, 'down')" :disabled="element.drillLevel === 'month'">+</button>
+                                        </span>
+                                    </span>
+                                    <span v-else>{{ element.name }}</span>
+                                    <button class="sort-icon-container" @click.stop="toggleSort(element)" :class="getSortClass(element)">
+                                        <svg class="sort-svg" viewBox="0 0 10 16"><path fill-rule="evenodd" d="M5 11L0 6l1.5-1.5L5 8.25 8.5 4.5 10 6z"></path></svg>
+                                    </button>
+                                    <button @click="removeFromShelf('rows', element)" class="remove-pill">×</button>
+                                </div>
+                            </template>
+                        </draggable>
+                    </div>
+                    <div class="shelf-group">
+                        <label>Color</label>
+                        <draggable v-model="activeShelves.color" class="shelf" item-key="name" group="fields" @change="handleShelfUpdate">
+                            <template #item="{element}">
+                                <div :class="['field-pill', element.type]">
+                                    {{ element.name }}
+                                    <button @click="removeFromShelf('color', element)" class="remove-pill">×</button>
+                                </div>
+                            </template>
+                        </draggable>
+                    </div>
+                </div>
+                <div class="filters-panel">
+                    <label>Filters</label>
+                    <draggable :list="activeShelves.filters" class="shelf filters-shelf" item-key="field" group="fields" @add="handleAddFilter">                        
+                        <template #item="{element}">
+                            <div class="field-pill" @click="activeFilter = element">
+                                {{ element.field }} <button @click.stop="removeFromShelf('filters', element)" class="remove-pill">×</button>
+                            </div>
+                        </template>
+                    </draggable>
+                </div>
+            </div>
+            <div class="canvas-panel">
+                <div id="chart-container" ref="chartContainer" class="chart-container" v-show="activeChartType !== 'table'"></div>
+                <div class="table-container" v-if="activeChartType === 'table'">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th v-for="header in uiState.tableData.headers" :key="header">{{ header }}</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr v-for="(row, rowIndex) in uiState.tableData.rows" :key="rowIndex">
+                                <td v-for="(header, colIndex) in uiState.tableData.headers" :key="colIndex" :style="getTableCellStyle(row[header], header)">
+                                    <span>{{ typeof row[header] === 'number' ? formatNumber(row[header]) : row[header] }}</span>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </main>
+
+        <div class="dashboard-grid" v-else-if="uiState.viewMode === 'dashboard'" ref="dashboardGridRef">
+            <div 
+                v-for="item in dashboardLayout"
+                :key="item.i"
+                class="dashboard-item" 
+                :style="gridItemStyle(item)"
+                @mousedown="dragStart(item, $event)"
+            >
+                <div class="dashboard-item-content">
+                    <div class="chart-title" @dblclick="startEdit(getWorksheetById(item.worksheetId))">
+                        <input
+                            v-if="uiState.editingId === item.worksheetId"
+                            type="text"
+                            class="title-editor"
+                            :id="`editor-${item.worksheetId}`"
+                            v-model="uiState.editText"
+                            @blur="saveEdit(getWorksheetById(item.worksheetId))"
+                            @keyup.enter="saveEdit(getWorksheetById(item.worksheetId))"
+                            @keyup.esc="cancelEdit"
+                            @click.stop
+                        />
+                        <span v-else>{{ getWorksheetById(item.worksheetId)?.name }}</span>
+                    </div>
+                    <div class="chart-container-grid" :id="'chart-container-' + item.worksheetId"></div>
+                    <button class="remove-from-dash" @click.stop="removeFromDashboard(item.i)">×</button>
+                </div>
+                <div class="resize-handle" @mousedown.stop="resizeStart(item, $event)"></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="welcome-panel" v-else>
+        <div class="welcome-content">
+            <span class="welcome-icon">📊</span>
+            <h2>Welcome to DataCanvas</h2>
+            <p>Load a CSV or .datacanvas file to begin your analysis.</p>
+        </div>
+    </div>
+    
+    <footer class="worksheet-tabs" v-if="dataState.records.length > 0">
+        <div 
+            v-for="sheet in worksheets" 
+            :key="sheet.id" 
+            class="tab"
+            :class="{ 'active': sheet.id === activeWorksheetId }"
+            @click="setActiveWorksheet(sheet.id)"
+            @dblclick="startEdit(sheet)">
+            
+            <input 
+                v-if="uiState.editingId === sheet.id"
+                type="text" 
+                class="tab-editor"
+                :id="`editor-${sheet.id}`"
+                v-model="uiState.editText" 
+                @blur="saveEdit(sheet)" 
+                @keyup.enter="saveEdit(sheet)" 
+                @keyup.esc="cancelEdit"
+                @click.stop
+            />
+            <span v-else>{{ sheet.name }}</span>
+    
+            <button class="close-tab" v-if="worksheets.length > 1 && uiState.editingId !== sheet.id" @click.stop="removeWorksheet(sheet.id)">×</button>
+        </div>
+        <button class="tab add-sheet" @click="addWorksheet">+</button>
+    </footer>
+
+    <aside class="context-panel" v-if="dataState.records.length > 0">
+        <div class="context-panel-header">
+            <div class="hamburger-container" ref="dropdownContainer">
+                <button class="action-button hamburger-menu" @click="toggleDropdown">
+                    <svg viewBox="0 0 100 100" class="hamburger-svg">
+                        <path d="M10 20L90 20M10 50L90 50M10 80L90 80" stroke="#fff" stroke-width="12" stroke-linecap="round"/>
+                    </svg>
+                </button>
+                <div v-if="uiState.isDropdownVisible" class="dropdown-menu">
+                    <a href="#" class="dropdown-item" @click.prevent="resetView">Reset View</a>
+                    <a href="#" class="dropdown-item" @click.prevent="exportAsPNG">Export as PNG</a>
+                    <a href="#" class="dropdown-item" @click.prevent="exportDataAsCSV">Export Data as CSV</a>
+                    <a href="#" class="dropdown-item" @click.prevent="modals.settings = true">Settings</a>
+                    <a href="#" class="dropdown-item disabled">Help (coming soon)</a>
+                </div>
+            </div>
+        </div>
+        
+        <div v-if="chartConfigured && uiState.viewMode === 'worksheet'" class="show-me-panel card">
+            <h3>Chart Types</h3>
+            <div class="suggestions-list">
+                <div v-for="suggestion in chartSuggestions" :key="suggestion.type" class="suggestion-button" @click="setChartType(suggestion.type)" :class="{ 'active-suggestion': suggestion.type === activeChartType }">
+                    <span class="suggestion-icon">{{ suggestion.icon }}</span>
+                    <span>{{ suggestion.name }}</span>
+                </div>
+            </div>
+        </div>
+
+        <div v-if="isAnalyticsPanelVisible" class="analytics-panel card">
+            <h3>Analytics</h3>
+            
+            <div class="settings-item" style="margin-bottom: 1rem;">
+                <span>Forecast Model</span>
+                <select class="settings-dropdown" v-model="activeWorksheet.analytics.model">
+                    <option value="linear">Linear Regression</option>
+                    <option value="smoothing">Exponential Smoothing</option>
+                </select>
+            </div>
+
+            <div class="settings-item">
+                <span>Show Trend Line</span>
+                <label class="theme-switch">
+                    <input type="checkbox" v-model="activeWorksheet.analytics.showTrendLine">
+                    <span class="switch-slider"></span>
+                </label>
+            </div>
+            <div v-if="activeWorksheet.analytics.showTrendLine" class="settings-item" style="margin-top: 1rem;">
+                <span>Forecast Periods</span>
+                <input type="number" class="topn-input" min="0" v-model.number="activeWorksheet.analytics.forecastPeriods">
+            </div>
+        </div>
+
+        <div v-if="activeFilter" class="filter-editor card">
+            <h3>Filter: {{ activeFilter.field }}</h3>
+            <div v-if="activeFilter.filter_type === 'dimension'">
+                <div class="filter-mode-switcher">
+                    <button :class="{ active: activeFilter.mode === 'list' }" @click="activeFilter.mode = 'list'">List</button>
+                    <button :class="{ active: activeFilter.mode === 'topN' }" @click="activeFilter.mode = 'topN'">Top N</button>
+                </div>
+                <div v-if="activeFilter.mode === 'list'" class="values-list">
+                    <div v-for="value in activeFilter.uniqueValues" :key="value" class="checkbox-item">
+                        <input type="checkbox" :id="value" :value="value" v-model="activeFilter.values">
+                        <label :for="value">{{ value }}</label>
+                    </div>
+                </div>
+                <div v-if="activeFilter.mode === 'topN'" class="topn-controls">
+                    <span>Show Top</span>
+                    <input type="number" v-model.number="activeFilter.n" min="1" class="topn-input">
+                    <span>items by</span>
+                    <select v-model="activeFilter.by" class="settings-dropdown">
+                        <option v-for="measure in dataState.measures" :key="measure.name" :value="measure.name">
+                            {{ measure.name }}
+                        </option>
+                    </select>
+                </div>
+            </div>
+            <div v-else-if="activeFilter.filter_type === 'range'">
+                <div class="range-inputs">
+                    <label>Min: <input type="number" v-model.number="activeFilter.values.min"></label>
+                    <label>Max: <input type="number" v-model.number="activeFilter.values.max"></label>
+                </div>
+            </div>
+        </div>
+        
+        <button class="action-button secondary" @click="openAnalysisModal" v-if="dataState.records.length">Run Statistical Analysis</button>
+
+    </aside>
+
+    <div v-if="uiState.contextMenu.visible" class="context-menu" :style="{ top: uiState.contextMenu.top + 'px', left: uiState.contextMenu.left + 'px' }">
+        <button class="context-menu-item" @click="openGroupModal">Group Values</button>
+        <button class="context-menu-item" @click="convertFieldType">
+            {{ uiState.contextMenu.field?.type === 'measure' ? 'Convert to Dimension' : 'Convert to Measure' }}
+        </button>
+    </div>
+
+    <div v-if="modals.grouping" class="modal-overlay" @click.self="modals.grouping = false">
+        <div class="modal-content">
+            <h2>Group Values in "{{ groupingState.field }}"</h2>
+            <label for="new-group-name">New Group Name</label>
+            <input type="text" id="new-group-name" v-model="groupingState.newGroupName" placeholder="e.g., West Coast">
+            <p>Select values to include in this group:</p>
+            <div class="values-list">
+                <div v-for="value in groupingState.uniqueValues" :key="value" class="checkbox-item">
+                    <input type="checkbox" :id="`group-${value}`" :value="value" v-model="groupingState.selectedValues">
+                    <label :for="`group-${value}`">{{ value }}</label>
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button class="action-button secondary" @click="modals.grouping = false">Cancel</button>
+                <button class="action-button" @click="submitGroup">Group</button>
+            </div>
+        </div>
+    </div>
+
+    <div v-if="modals.binning" class="modal-overlay" @click.self="modals.binning = false">
+        <div class="modal-content">
+            <h2>Create Bins</h2>
+            <label for="bin-field-name">Bin Name</label>
+            <input type="text" id="bin-field-name" v-model="binningState.binName" placeholder="e.g., Sales Bins">
+    
+            <label for="measure-to-bin">Measure to Bin</label>
+            <select id="measure-to-bin" v-model="binningState.measure" class="settings-dropdown">
+                <option v-for="m in dataState.measures" :key="m.name" :value="m.name">{{ m.name }}</option>
+            </select>
+    
+            <label for="bin-size">Bin Size</label>
+            <input type="number" id="bin-size" v-model.number="binningState.binSize" min="1">
+            <p class="formula-hint">Defines the size of each bin (e.g., a bin size of 100 on a Sales field creates bins like 0-100, 101-200, etc.).</p>
+            
+            <div class="modal-actions">
+                <button class="action-button secondary" @click="modals.binning = false">Cancel</button>
+                <button class="action-button" @click="submitBin" :disabled="!binningState.binName || !binningState.measure || !binningState.binSize">Create Bins</button>
+            </div>
+        </div>
+    </div>
+
+    <div v-if="modals.statisticalAnalysis" class="modal-overlay" @click.self="modals.statisticalAnalysis = false">
+        <div class="modal-content">
+            <h2>Statistical Analysis</h2>
+    
+            <div class="analysis-controls">
+                <label for="analysis-type">Select Test</label>
+                <select id="analysis-type" v-model="analysisState.testType" class="settings-dropdown">
+                    <option value="correlation">Correlation Analysis</option>
+                    <option value="ttest">Two-Sample T-Test</option>
+                    <option value="zscore">Z-Score Outliers</option>
+                    <option value="clustering">K-Means Clustering</option> 
+                </select>
+    
+                <div v-if="analysisState.testType === 'correlation'" class="analysis-inputs">
+                    <label>Measure 1:</label>
+                    <select v-model="analysisState.measure1" class="settings-dropdown">
+                        <option v-for="m in dataState.measures" :key="m.name">{{ m.name }}</option>
+                    </select>
+                    <label>Measure 2:</label>
+                    <select v-model="analysisState.measure2" class="settings-dropdown">
+                        <option v-for="m in dataState.measures" :key="m.name">{{ m.name }}</option>
+                    </select>
+                </div>
+    
+                <div v-if="analysisState.testType === 'ttest'" class="analysis-inputs">
+                    <label>Measure:</label>
+                    <select v-model="analysisState.ttest.measure" class="settings-dropdown">
+                        <option v-for="m in dataState.measures" :key="m.name">{{ m.name }}</option>
+                    </select>
+                    <label>Group Dimension:</label>
+                    <select v-model="analysisState.ttest.dimension" class="settings-dropdown">
+                        <option v-for="d in dataState.dimensions" :key="d.name">{{ d.name }}</option>
+                    </select>
+                    <p class="formula-hint">This test compares the mean of the two largest groups in the selected dimension.</p>
+                </div>
+    
+                <div v-if="analysisState.testType === 'zscore'" class="analysis-inputs">
+                    <label>Measure for Z-Score:</label>
+                    <select v-model="analysisState.zscore.measure" class="settings-dropdown">
+                        <option v-for="m in dataState.measures" :key="m.name">{{ m.name }}</option>
+                    </select>
+                </div>
+
+                <div v-if="analysisState.testType === 'clustering'" class="analysis-inputs">
+                    <label>Number of Clusters (K):</label>
+                    <input type="number" class="topn-input" v-model.number="analysisState.clustering.k" min="2">
+                    <label>Fields to Cluster:</label>
+                    <div class="values-list" style="max-height: 150px;">
+                        <div v-for="m in dataState.measures" :key="m.name" class="checkbox-item">
+                            <input type="checkbox" :id="`cluster-${m.name}`" :value="m.name" v-model="analysisState.clustering.fields">
+                            <label :for="`cluster-${m.name}`">{{ m.name }}</label>
+                        </div>
+                    </div>
+                    <p class="formula-hint">Clusters will be added as a new dimension. Best visualized on a scatter plot.</p>
+                </div>
+                
+            </div>
+    
+            <div v-if="analysisState.result" class="analysis-results">
+                <h3>Results</h3>
+                <div class="results-table">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th v-for="header in analysisState.result.headers">{{ header }}</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr v-for="row in analysisState.result.rows">
+                                <td v-for="cell in row">{{ cell }}</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+    
+            <div class="modal-actions">
+                <button class="action-button secondary" @click="modals.statisticalAnalysis = false">Close</button>
+                <button class="action-button" @click="runAnalysis" :disabled="!canRunAnalysis">Run Analysis</button>
+            </div>
+        </div>
+    </div>
+
+    <div v-if="modals.settings" class="modal-overlay" @click.self="modals.settings = false">
+        <div class="modal-content">
+            <h2>Settings</h2>
+            <div class="settings-item">
+                <span>Dark Mode</span>
+                <label class="theme-switch">
+                    <input type="checkbox" v-model="isDarkTheme">
+                    <span class="switch-slider"></span>
+                </label>
+            </div>
+            <div class="settings-item" style="margin-top: 1.5rem;">
+                <span>Auto-Update Chart</span>
+                <label class="theme-switch">
+                    <input type="checkbox" v-model="settings.autoUpdateEnabled">
+                    <span class="switch-slider"></span>
+                </label>
+            </div>
+            <div class="settings-item" style="margin-top: 1.5rem;">
+                <span>Number Formatting</span>
+                <select class="settings-dropdown" v-model="settings.activeNumberFormat">
+                    <option v-for="(label, key) in numberFormats" :key="key" :value="key">
+                        {{ label }}
+                    </option>
+                </select>
+            </div>
+            <div class="settings-item palette-setting">
+                <span>Chart Color Palette</span>
+                <div class="palette-selector">
+                    <div v-for="(colors, name) in palettes" :key="name" class="palette-option" @click="settings.activePalette = name">
+                        <input type="radio" :id="name" :value="name" v-model="settings.activePalette">
+                        <label :for="name">
+                            <span class="palette-name">{{ name }}</span>
+                            <div class="palette-preview">
+                                <span v-for="color in colors" :style="{ backgroundColor: color }"></span>
+                            </div>
+                        </label>
+                    </div>
+                </div>
+            </div>
+            <div class="settings-item" style="margin-top: 2rem; border-top: 1px solid var(--border-color); padding-top: 1.5rem;">
+                <button class="action-button secondary" @click="resetApplication">Reset Application</button>
+            </div>
+            <div class="modal-actions">
+                <button class="action-button" @click="modals.settings = false">Done</button>
+            </div>
+        </div>
+    </div>
+
+    <div v-if="modals.calculatedField" class="modal-overlay" @click.self="modals.calculatedField = false">
+        <div class="modal-content">
+            <h2>Create Calculated Field</h2>
+            <label for="calc-field-name">Field Name</label>
+            <input type="text" id="calc-field-name" v-model="newCalcField.name" placeholder="e.g., Profit Ratio">
+            <label for="calc-field-formula">Formula</label>
+            <textarea id="calc-field-formula" v-model="newCalcField.formula" placeholder="e.g., SUM([Profit]) / SUM([Sales])"></textarea>
+            <p class="formula-hint">Supports SUM, AVG, COUNT, and COUNTD functions.</p>
+            <div class="modal-actions">
+                <button class="action-button secondary" @click="modals.calculatedField = false">Cancel</button>
+                <button class="action-button" @click="submitCalcField">Create Field</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.global.prod.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/vuedraggable@4.1.0/dist/vuedraggable.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/map/js/world.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/simple-statistics@7.8.3/dist/simple-statistics.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/echarts-wordcloud@2.1.0/dist/echarts-wordcloud.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/kmeans-js@0.1.2/kMeans.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/etsjs@1.0.1/dist/ets.min.js"></script>
+<script src="script.js" defer></script>
+
+</body>
+</html>
