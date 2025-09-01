@@ -1,4 +1,4 @@
-const apiUrl = 'https://datacanvas-api.onrender.com/';
+const apiUrl = 'https://datacanvas-api.onrender.com';
 
 const { createApp, ref, reactive, watch, computed, onMounted, nextTick } = Vue;
 
@@ -1101,73 +1101,100 @@ const app = createApp({
         };
 
         const runAnalysis = async () => {
+            // 1. Reset state and show loading spinner
             analysisState.result = null;
             analysisState.error = '';
             setLoading(true);
-
+        
             try {
-                const payload = {
-                    testType: analysisState.testType,
+                let endpoint = '';
+                let payload = {
                     records: JSON.parse(JSON.stringify(dataState.records)),
-                    params: {}
                 };
-
+        
+                // 2. Determine the correct API endpoint and build the payload
                 switch (analysisState.testType) {
                     case 'correlation':
-                        if (!analysisState.measure1 || !analysisState.measure2) throw new Error('Please select two measures.');
-                        payload.params = { measure1: analysisState.measure1, measure2: analysisState.measure2 };
+                        endpoint = '/analysis/correlation';
+                        payload.measure1 = analysisState.measure1;
+                        payload.measure2 = analysisState.measure2;
                         break;
                     case 'ttest':
-                        if (!analysisState.ttest.measure || !analysisState.ttest.dimension) throw new Error('Please select a measure and a dimension.');
-                        payload.params = { measure: analysisState.ttest.measure, dimension: analysisState.ttest.dimension };
+                        endpoint = '/analysis/t-test';
+                        payload.measure = analysisState.ttest.measure;
+                        payload.dimension = analysisState.ttest.dimension;
                         break;
                     case 'zscore':
-                        if (!analysisState.zscore.measure) throw new Error('Please select a measure.');
-                        payload.params = { measure: analysisState.zscore.measure };
+                        endpoint = '/ml/z-score-outliers';
+                        payload.measure = analysisState.zscore.measure;
                         break;
-
                     case 'clustering':
-                        if (analysisState.clustering.fields.length < 2) throw new Error('Please select at least two measures to cluster.');
-                        payload.params = { k: analysisState.clustering.k, fields: analysisState.clustering.fields};
+                        endpoint = '/ml/kmeans-clustering';
+                        payload.fields = analysisState.clustering.fields;
+                        payload.n_clusters = analysisState.clustering.k;
                         break;
                     default:
                         throw new Error('Invalid test type selected.');
                 }
-                
-                const workerResult = await new Promise((resolve, reject) => {
-                    const tempWorker = new Worker('worker.js');
-                    tempWorker.onmessage = (event) => {
-                        tempWorker.terminate();
-                        resolve(event.data);
-                    };
-                    tempWorker.onerror = (error) => {
-                        tempWorker.terminate();
-                        reject(error);
-                    };
-                    tempWorker.postMessage({ type: 'runAnalysis', payload });
+        
+                // 3. Call the API using fetch
+                const response = await fetch(`${apiUrl}${endpoint}`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(payload)
                 });
-
-                if (workerResult.error) {
-                    analysisState.error = workerResult.error;
-                } else {
-                    if (analysisState.testType === 'clustering') {
-                        // For clustering, we update the main dataset and close the modal
-                        dataState.records = workerResult.records;
-                        if (!dataState.dimensions.some(d => d.name === 'Cluster')) {
-                            dataState.dimensions.push({ name: 'Cluster', type: 'dimension' });
-                        }
-                        modals.statisticalAnalysis = false;
-                        alert('Clustering complete! A new "Cluster" dimension has been added.');
-                        requestVisualizationUpdate(); // Redraw the chart
-                    } else {
-                        // For other analyses, we just show the results in the modal
-                        analysisState.result = workerResult.result;
-                    }
+        
+                // 4. Handle errors from the API
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(errorData.detail || 'The API request failed.');
                 }
+        
+                const apiResult = await response.json();
+        
+                // 5. Process the successful API response
+                if (analysisState.testType === 'clustering') {
+                    // Special case for clustering: update the main dataset
+                    dataState.records = apiResult.records;
+                    if (!dataState.dimensions.some(d => d.name === 'Cluster')) {
+                        dataState.dimensions.push({ name: 'Cluster', type: 'dimension' });
+                    }
+                    modals.statisticalAnalysis = false;
+                    alert('Clustering complete! A new "Cluster" dimension has been added.');
+                    requestVisualizationUpdate();
+                } else {
+                    // For all other tests, format the results for the display table
+                    const result = apiResult.result;
+                    let headers = [];
+                    let rows = [];
+        
+                    if (result.correlation_coefficient !== undefined) {
+                        headers = ['Measures', 'Correlation Coefficient'];
+                        rows = [
+                            [`${payload.measure1} & ${payload.measure2}`, result.correlation_coefficient.toFixed(4)]
+                        ];
+                    } else if (result.t_statistic !== undefined) {
+                        headers = ['T-Statistic', 'P-Value'];
+                        rows = [
+                            [result.t_statistic.toFixed(4), result.p_value.toFixed(4)]
+                        ];
+                    } else if (result.outliers) {
+                        headers = result.outliers.length > 0 ? Object.keys(result.outliers[0]) : ['Message'];
+                        rows = result.outliers.length > 0 ? result.outliers.map(o => Object.values(o)) : [
+                            [result.message || 'No outliers found']
+                        ];
+                    }
+                    analysisState.result = { headers, rows };
+                }
+        
             } catch (e) {
+                // 6. Catch any errors and display them
                 console.error("Analysis failed:", e);
                 analysisState.error = e.message;
             } finally {
+                // 7. Always hide the loading spinner
                 setLoading(false);
             }
         };
@@ -1280,7 +1307,3 @@ const app = createApp({
 
 app.component('draggable', vuedraggable);
 app.mount('#app');
-
-
-chartSuggestions
-
