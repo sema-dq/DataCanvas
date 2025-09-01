@@ -1,3 +1,5 @@
+const apiUrl = 'https://datacanvas-api.onrender.com/';
+
 const { createApp, ref, reactive, watch, computed, onMounted, nextTick } = Vue;
 
 const debounce = (func, delay) => {
@@ -1278,5 +1280,6 @@ const app = createApp({
 
 app.component('draggable', vuedraggable);
 app.mount('#app');
+
 
 chartSuggestions
