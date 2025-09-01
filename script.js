@@ -1283,3 +1283,4 @@ app.mount('#app');
 
 
 chartSuggestions
+
