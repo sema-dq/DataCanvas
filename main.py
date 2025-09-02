@@ -427,4 +427,5 @@ async def api_get_unique_values(payload: UniqueValuesPayload):
 
 @app.get("/", include_in_schema=False)
 async def read_root():
-    return {"message": "Welcome to the DataCanvas API!"}
+    return {"message": "Welcome to the DataCanvas Pro API!"}
+
