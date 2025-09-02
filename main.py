@@ -1,10 +1,11 @@
+# backend/main.py
 from typing import List, Dict, Any, Literal, Optional
 
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, field_validator, ConfigDict
+from pydantic import BaseModel, field_validator, ConfigDict, SecretStr
 from scipy import stats
 from sklearn.linear_model import LinearRegression
 from sklearn.cluster import KMeans
@@ -12,8 +13,18 @@ from statsmodels.tsa.holtwinters import ExponentialSmoothing
 import statsmodels.api as sm
 from statsmodels.formula.api import ols
 
-# --- Application Setup ---
+# Database connection libraries
+import psycopg2
+import mysql.connector
+import pymssql
+
+
+# --- Enhanced Application Setup ---
 tags_metadata = [
+    {
+        "name": "Data Sources",
+        "description": "Endpoints for connecting to and loading data from various sources.",
+    },
     {
         "name": "Data Cleaning & Transformation",
         "description": "Endpoints for preparing and cleaning datasets.",
@@ -33,7 +44,7 @@ tags_metadata = [
 ]
 
 app = FastAPI(
-    title="DataCanvas API",
+    title="DataCanvas Apex API",
     description="A massively enhanced, enterprise-grade API for advanced data analysis, machine learning, and visualization.",
     version="5.0.0",
     openapi_tags=tags_metadata,
@@ -48,6 +59,19 @@ app.add_middleware(
 )
 
 # --- Pydantic Models ---
+
+# NEW: Models for Database Connections
+class DBConnectionPayload(BaseModel):
+    db_type: Literal['postgresql', 'mysql', 'sqlserver']
+    host: str
+    port: int
+    user: str
+    password: SecretStr
+    dbname: str
+
+class DBTablePayload(DBConnectionPayload):
+    table_name: str
+
 class BaseDataPayload(BaseModel):
     records: List[Dict[str, Any]]
 
@@ -57,7 +81,6 @@ class BaseDataPayload(BaseModel):
             raise ValueError("The 'records' list cannot be empty.")
         return v
 
-# ChartPayload now supports all frontend chart types.
 class ChartPayload(BaseDataPayload):
     x_axis: Optional[str] = None
     y_axis: Optional[str] = None
@@ -66,7 +89,6 @@ class ChartPayload(BaseDataPayload):
     chart_type: Literal['bar', 'line', 'scatter', 'pie', 'heatmap', 'treemap', 'combo', 'boxplot', 'sankey', 'wordCloud', 'gantt']
     aggregation: Literal['sum', 'mean', 'count', 'median', 'min', 'max', 'stdev', 'var'] = 'sum'
     analytics: Optional[Dict] = None
-    # Support for multiple dimensions in charts like Sankey and Gantt
     dimensions: Optional[List[str]] = None
     measures: Optional[List[str]] = None
     
@@ -79,7 +101,6 @@ class ChartPayload(BaseDataPayload):
         }]
     })
 
-# Advanced Payloads for new statistical and ML features
 class AnovaPayload(BaseDataPayload):
     measure: str
     dimension: str
@@ -103,7 +124,6 @@ class ForecastPayload(BaseDataPayload):
     forecast_periods: int
     model: Literal['linear', 'smoothing'] = 'linear'
 
-# Existing Payloads (unchanged)
 class GroupValuesPayload(BaseDataPayload):
     field_name: str
     new_group_name: str
@@ -128,16 +148,52 @@ class BinningPayload(BaseDataPayload):
     bin_size: int
     bin_name: str
 
+# --- Database Connector ---
+class DatabaseConnector:
+    def __init__(self, params: DBConnectionPayload):
+        self.db_type = params.db_type
+        self.host = params.host
+        self.port = params.port
+        self.user = params.user
+        self.password = params.password.get_secret_value()
+        self.dbname = params.dbname
+        self.connection = None
+
+    def __enter__(self):
+        try:
+            if self.db_type == 'postgresql':
+                self.connection = psycopg2.connect(
+                    dbname=self.dbname, user=self.user, password=self.password, host=self.host, port=self.port
+                )
+            elif self.db_type == 'mysql':
+                self.connection = mysql.connector.connect(
+                    host=self.host, port=self.port, user=self.user, password=self.password, database=self.dbname
+                )
+            elif self.db_type == 'sqlserver':
+                self.connection = pymssql.connect(
+                    server=self.host, port=self.port, user=self.user, password=self.password, database=self.dbname
+                )
+            return self.connection
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Database connection failed: {e}")
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.connection:
+            self.connection.close()
+
 # --- Data Processing Logic ---
 class DataProcessor:
     def __init__(self, records: List[Dict[str, Any]]):
         self.df = pd.DataFrame(records).copy()
-        # More robust initial type conversion
         for col in self.df.columns:
             if pd.api.types.is_numeric_dtype(self.df[col]):
                 self.df[col] = pd.to_numeric(self.df[col], errors='coerce')
-            elif pd.api.types.is_datetime64_any_dtype(self.df[col]):
-                self.df[col] = pd.to_datetime(self.df[col], errors='coerce')
+            # Attempt to convert object columns to datetime if they look like dates
+            elif self.df[col].dtype == 'object':
+                try:
+                    self.df[col] = pd.to_datetime(self.df[col])
+                except (ValueError, TypeError):
+                    pass # Ignore columns that can't be converted
 
     def _validate_fields(self, *fields: str):
         missing_fields = [f for f in fields if f and f not in self.df.columns]
@@ -175,7 +231,6 @@ class DataProcessor:
             raise HTTPException(status_code=400, detail="Invalid imputation strategy.")
         self.df[field].fillna(fill_value, inplace=True)
 
-    # --- Existing methods ---
     def group_values(self, field: str, new_name: str, values: List[Any]):
         self._validate_fields(field)
         new_col_name = f"{field}_grouped"
@@ -222,7 +277,6 @@ class DataProcessor:
         outliers_df = self.df[self.df['z_score'].abs() > 3]
         return {"outliers": self._clean_for_json(outliers_df.to_dict('records'))}
 
-    # Forecasting now supports Exponential Smoothing
     def run_time_series_forecast(self, date_field: str, value_field: str, forecast_periods: int, model_type: str):
         self._validate_fields(date_field, value_field)
         temp_df = self.df[[date_field, value_field]].copy()
@@ -230,7 +284,7 @@ class DataProcessor:
         temp_df.set_index(date_field, inplace=True)
         temp_df = temp_df.asfreq(pd.infer_freq(temp_df.index), method='ffill').dropna()
 
-        if model_type == 'smoothing':
+        if model_type == 'smoothing' and len(temp_df) >= 24: # Holt-Winters needs sufficient data
             model = ExponentialSmoothing(temp_df[value_field], trend='add', seasonal='add', seasonal_periods=12).fit()
             predictions = model.forecast(forecast_periods)
         else: # Default to linear regression
@@ -242,22 +296,19 @@ class DataProcessor:
         
         return {"predictions": self._clean_for_json(predictions.tolist())}
 
-    # ANOVA Test
     def run_anova(self, measure: str, dimension: str):
         self._validate_fields(measure, dimension)
-        formula = f'`{measure}` ~ C(`{dimension}`)'
+        formula = f"`{measure}` ~ C(`{dimension}`)"
         model = ols(formula, data=self.df).fit()
         anova_table = sm.stats.anova_lm(model, typ=2)
         return {"f_statistic": anova_table['F'][0], "p_value": anova_table['PR(>F)'][0]}
 
-    # Chi-Square Test
     def run_chi_square_test(self, dimension1: str, dimension2: str):
         self._validate_fields(dimension1, dimension2)
         contingency_table = pd.crosstab(self.df[dimension1], self.df[dimension2])
         chi2, p, dof, expected = stats.chi2_contingency(contingency_table)
         return {"chi2_statistic": chi2, "p_value": p, "degrees_of_freedom": dof}
 
-    # K-Means Clustering
     def run_kmeans_clustering(self, fields: List[str], n_clusters: int):
         self._validate_fields(*fields)
         data = self.df[fields].dropna()
@@ -267,10 +318,47 @@ class DataProcessor:
         kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
         clusters = kmeans.fit_predict(data)
         
-        # Add cluster labels to the original DataFrame
         self.df.loc[data.index, 'Cluster'] = [f'Cluster {c+1}' for c in clusters]
-        
+
 # --- API Endpoints ---
+
+@app.post("/data/connect", tags=["Data Sources"])
+async def api_connect_to_db(payload: DBConnectionPayload):
+    query = ""
+    if payload.db_type == 'postgresql':
+        query = "SELECT table_name FROM information_schema.tables WHERE table_schema='public'"
+    elif payload.db_type == 'mysql':
+        query = "SHOW TABLES"
+    elif payload.db_type == 'sqlserver':
+        query = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'"
+
+    try:
+        with DatabaseConnector(payload) as conn:
+            cursor = conn.cursor()
+            cursor.execute(query)
+            tables = [row[0] for row in cursor.fetchall()]
+            return {"status": "success", "tables": tables}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/data/load-table", tags=["Data Sources"])
+async def api_load_db_table(payload: DBTablePayload):
+    if not payload.table_name.isalnum() and "_" not in payload.table_name:
+        raise HTTPException(status_code=400, detail="Invalid table name.")
+        
+    query = f'SELECT * FROM "{payload.table_name}"'
+    if payload.db_type == 'mysql':
+        query = f"SELECT * FROM `{payload.table_name}`"
+    elif payload.db_type == 'sqlserver':
+        query = f'SELECT * FROM [{payload.table_name}]'
+
+    try:
+        with DatabaseConnector(payload) as conn:
+            df = pd.read_sql(query, conn)
+            processor = DataProcessor(df.to_dict('records'))
+            return {"status": "success", "records": processor.to_records()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/actions/impute", tags=["Data Cleaning & Transformation"])
 async def api_impute(payload: ImputationPayload):
@@ -328,6 +416,8 @@ async def api_run_kmeans(payload: KMeansPayload):
 
 @app.post("/charts/generate", tags=["Chart Generation"])
 async def api_generate_chart(payload: ChartPayload):
+    # This endpoint is currently a passthrough as the frontend handles chart data processing.
+    # It can be expanded later for complex server-side rendering if needed.
     return {"status": "success", "chartData": payload.records}
 
 @app.post("/data/unique-values", tags=["Data Cleaning & Transformation"])
