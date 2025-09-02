@@ -1,7 +1,11 @@
 fastapi
-uvicorn
+uvicorn[standard]
 pandas
 numpy
 scipy
 scikit-learn
 statsmodels
+psycopg2-binary
+mysql-connector-python
+pymssql
+pydantic
